@@ -51,7 +51,7 @@ class AI(commands.Cog, name="ai"):
                 })
 
         async with aiohttp.ClientSession() as session:
-            url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key={os.getenv("GEMINI_KEY")}'
+            url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key={os.getenv("GEMINI_KEY")}'
             data = {"system_instruction": {"parts": [{"text": system}]}, "contents": [{"parts": parts}]}
             async with session.post(url, json=data) as response:
                 if response.status != 200:
