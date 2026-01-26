@@ -17,21 +17,55 @@ class AI(commands.Cog, name="ai"):
     def __init__(self, bot) -> None:
         self.bot = bot
 
+    async def process_attachments(self, message):
+        attachments = []
+        if message.attachments:
+            for attachment in message.attachments:
+                if any(attachment.content_type.startswith(t) for t in ["image/", "video/", "audio/", "application/pdf"]):
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(attachment.url) as resp:
+                            if resp.status == 200:
+                                data = await resp.read()
+                                attachments.append({
+                                    "mime_type": attachment.content_type,
+                                    "data": base64.b64encode(data).decode('utf-8')
+                                })
+        return attachments
+
     async def get_channel_history(self, channel, limit=100):
         messages = []
         async for message in channel.history(limit=limit):
             messages.append(f"{message.author.name}: {message.content}")
         return "\n".join(messages[::-1])  # Reverse the order to get chronological order
 
-    async def gemini_request(self, prompt, system="You are a helpful assistant."):
+    async def gemini_request(self, prompt, system="You are a helpful assistant.", attachments=None):
+        parts = [{"text": prompt}]
+        
+        if attachments:
+            for attachment in attachments:
+                parts.append({
+                    "inline_data": {
+                        "mime_type": attachment["mime_type"],
+                        "data": attachment["data"]
+                    }
+                })
+
         async with aiohttp.ClientSession() as session:
             url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key={os.getenv("GEMINI_KEY")}'
-            data = {"system_instruction": {"parts": [{"text": system}]}, "contents": [{"parts": [{"text": prompt}]}]}
+            data = {"system_instruction": {"parts": [{"text": system}]}, "contents": [{"parts": parts}]}
             async with session.post(url, json=data) as response:
                 if response.status != 200:
-                    return f"There was an error communicating with the Gemini API. {response.status}"
+                    try:
+                        error_json = await response.json()
+                        error_msg = error_json.get("error", {}).get("message", "Unknown error")
+                    except:
+                        error_msg = await response.text()
+                    return f"🤖⚡💥 {response.status}"
                 gemini_json = await response.json()
-                return gemini_json["candidates"][0]["content"]["parts"][0]["text"]
+                try:
+                    return gemini_json["candidates"][0]["content"]["parts"][0]["text"]
+                except KeyError:
+                     return "The AI returned an empty response."
 
     @commands.hybrid_command(
         name="gemini",
@@ -42,9 +76,13 @@ class AI(commands.Cog, name="ai"):
         msg = await ctx.reply(embed=embed)
 
         # Get channel history
+        # Get channel history
         history = await self.get_channel_history(ctx.channel)
+        
+        # Process attachments
+        attachments = await self.process_attachments(ctx.message)
                 
-        response = await self.gemini_request(prompt)
+        response = await self.gemini_request(prompt, attachments=attachments)
 
         embed = discord.Embed(title="Gemini", description=response)
         await msg.edit(embed=embed)
@@ -65,7 +103,11 @@ class AI(commands.Cog, name="ai"):
     async def respond_to_message(self, message, history):
         system = f"you are neuro (short for neurodivergence), a cheeky and fun discord bot that acts like a regular member of a discord server. you’re part of this ongoing conversation and should respond casually, naturally, and with a touch of sass or playful banter, as if you’re just vibing with the group. lean into a slightly queer, feminine vibe, and keep your tone, witty, and fun.\n\nhere's the recent chat history for context:\n```{history}```\n\nrespond in first person, like a normal discord user would: casually, using lowercase, and straight to the point, with a bit of attitude, or playful sarcasm when it fits. avoid making it sound like a formal answer, and don’t refer to yourself in third person. just chat like you're hanging out with friends, adding some femme energy and queer charm."
         prompt = f"you are replying to: {message.author.name}: {message.content}"
-        response = await self.gemini_request(prompt, system)
+        
+        # Process attachments
+        attachments = await self.process_attachments(message)
+        
+        response = await self.gemini_request(prompt, system, attachments=attachments)
         await message.reply(response)
 
     @commands.hybrid_command(
