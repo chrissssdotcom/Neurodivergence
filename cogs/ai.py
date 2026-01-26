@@ -32,7 +32,7 @@ class AI(commands.Cog, name="ai"):
                                 })
         return attachments
 
-    async def get_channel_history(self, channel, limit=100):
+    async def get_channel_history(self, channel, limit=50):
         messages = []
         async for message in channel.history(limit=limit):
             messages.append(f"{message.author.name}: {message.content}")
