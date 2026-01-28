@@ -38,7 +38,7 @@ class AI(commands.Cog, name="ai"):
             messages.append(f"{message.author.name}: {message.content}")
         return "\n".join(messages[::-1])  # Reverse the order to get chronological order
 
-    async def gemini_request(self, prompt, system="You are a helpful assistant.", model="gemini-flash-lite-latest", attachments=None):
+    async def gemini_request(self, prompt, system="You are a helpful assistant.", model="gemini-flash-lite-latest", attachments=None, api_keys=None):
         parts = [{"text": prompt}]
         
         if attachments:
@@ -50,22 +50,59 @@ class AI(commands.Cog, name="ai"):
                     }
                 })
 
-        async with aiohttp.ClientSession() as session:
-            url = f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={os.getenv("GEMINI_KEY")}'
-            data = {"system_instruction": {"parts": [{"text": system}]}, "contents": [{"parts": parts}]}
-            async with session.post(url, json=data) as response:
-                if response.status != 200:
-                    try:
-                        error_json = await response.json()
-                        error_msg = error_json.get("error", {}).get("message", "Unknown error")
-                    except:
-                        error_msg = await response.text()
-                    return f"🤖⚡💥 {response.status}"
-                gemini_json = await response.json()
+        # Load keys if not provided
+        if api_keys is None:
+            gemini_keys_env = os.environ.get("GEMINI_KEYS")
+            if gemini_keys_env:
                 try:
-                    return gemini_json["candidates"][0]["content"]["parts"][0]["text"]
-                except KeyError:
-                     return "The AI returned an empty response."
+                    api_keys = json.loads(gemini_keys_env)
+                except json.JSONDecodeError:
+                     # Fallback if JSON is invalid, treat as single key if it looks like one, or empty
+                     api_keys = []
+            
+            if not api_keys:
+                single_key = os.environ.get("GEMINI_KEY")
+                if single_key:
+                    api_keys = [single_key]
+        
+        if not api_keys:
+             return "🤖⚡💥 Error: No Gemini API keys found."
+
+        # Create a copy to rotate through
+        keys_to_try = list(api_keys)
+        last_error = "Unknown error"
+        
+        async with aiohttp.ClientSession() as session:
+            while keys_to_try:
+                current_key = random.choice(keys_to_try)
+                keys_to_try.remove(current_key) # Don't retry the same key in this request
+                
+                url = f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={current_key}'
+                data = {"system_instruction": {"parts": [{"text": system}]}, "contents": [{"parts": parts}]}
+                
+                async with session.post(url, json=data) as response:
+                    if response.status == 200:
+                        gemini_json = await response.json()
+                        try:
+                            return gemini_json["candidates"][0]["content"]["parts"][0]["text"]
+                        except KeyError:
+                             return "The AI returned an empty response."
+                    elif response.status == 429:
+                        last_error = f"429 Too Many Requests (Key: ...{current_key[-4:]})"
+                        # Continue to next key
+                        continue
+                    else:
+                        # For other errors, we might probably want to return immediately or also retry? 
+                        # Implementation plan said "If other error: Return the error message"
+                         try:
+                             error_json = await response.json()
+                             error_msg = error_json.get("error", {}).get("message", "Unknown error")
+                         except:
+                             error_msg = await response.text()
+                         return f"🤖⚡💥 {response.status}: {error_msg}"
+            
+            # If we run out of keys
+            return f"🤖⚡💥 All keys exhausted. Last error: {last_error}"
 
     @commands.hybrid_command(
         name="gemini",
