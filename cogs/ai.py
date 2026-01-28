@@ -38,7 +38,7 @@ class AI(commands.Cog, name="ai"):
             messages.append(f"{message.author.name}: {message.content}")
         return "\n".join(messages[::-1])  # Reverse the order to get chronological order
 
-    async def gemini_request(self, prompt, system="You are a helpful assistant.", attachments=None):
+    async def gemini_request(self, prompt, system="You are a helpful assistant.", model="gemini-flash-lite-latest", attachments=None):
         parts = [{"text": prompt}]
         
         if attachments:
@@ -51,7 +51,7 @@ class AI(commands.Cog, name="ai"):
                 })
 
         async with aiohttp.ClientSession() as session:
-            url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key={os.getenv("GEMINI_KEY")}'
+            url = f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={os.getenv("GEMINI_KEY")}'
             data = {"system_instruction": {"parts": [{"text": system}]}, "contents": [{"parts": parts}]}
             async with session.post(url, json=data) as response:
                 if response.status != 200:
@@ -82,7 +82,7 @@ class AI(commands.Cog, name="ai"):
         # Process attachments
         attachments = await self.process_attachments(ctx.message)
                 
-        response = await self.gemini_request(prompt, attachments=attachments)
+        response = await self.gemini_request(prompt, attachments=attachments, model="gemini-flash-latest")
 
         embed = discord.Embed(title="Gemini", description=response)
         await msg.edit(embed=embed)
@@ -91,13 +91,10 @@ class AI(commands.Cog, name="ai"):
     async def on_message(self, message):
         if message.author.bot:
             return
-
-        history = await self.get_channel_history(message.channel)
         
         # Check for keywords
         if "neuro" in message.content.lower() or "neurodivergence" in message.content.lower():
-            await self.respond_to_message(message, history)
-        elif random.random() < 0.05:  # 5% chance
+            history = await self.get_channel_history(message.channel)
             await self.respond_to_message(message, history)
 
     async def respond_to_message(self, message, history):
@@ -107,7 +104,7 @@ class AI(commands.Cog, name="ai"):
         # Process attachments
         attachments = await self.process_attachments(message)
         
-        response = await self.gemini_request(prompt, system, attachments=attachments)
+        response = await self.gemini_request(prompt, system, attachments=attachments, model="gemini-flash-lite-latest")
         await message.reply(response)
 
     @commands.hybrid_command(
