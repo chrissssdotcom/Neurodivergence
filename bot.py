@@ -145,21 +145,24 @@ class DiscordBot(commands.Bot):
         full_command_name = context.command.qualified_name
         split = full_command_name.split(" ")
         executed_command = str(split[0])
-        log_channel = bot.get_channel(int(os.getenv("LOGGING_CHANNEL")))
+        logging_channel_id = os.getenv("LOGGING_CHANNEL")
+        log_channel = bot.get_channel(int(logging_channel_id)) if logging_channel_id else None
         if context.guild is not None:
             self.logger.info(
                 f"Executed {executed_command} command in {context.guild.name} (ID: {context.guild.id}) by {context.author} (ID: {context.author.id})"
             )
-            embed = discord.Embed(title=f"Command run by {context.author}")
-            embed.add_field(name=f"in {context.guild.name}", value=context.message.content, inline=True)
-            await log_channel.send(embed=embed)
+            if log_channel:
+                embed = discord.Embed(title=f"Command run by {context.author}")
+                embed.add_field(name=f"in {context.guild.name}", value=context.message.content, inline=True)
+                await log_channel.send(embed=embed)
         else:
             self.logger.info(
                 f"Executed {executed_command} command by {context.author} (ID: {context.author.id}) in DMs"
             )
-            embed = discord.Embed(title=f"Command run by {context.author}")
-            embed.add_field(name="in DMs", value=context.message.content, inline=True)
-            await log_channel.send(embed=embed)
+            if log_channel:
+                embed = discord.Embed(title=f"Command run by {context.author}")
+                embed.add_field(name="in DMs", value=context.message.content, inline=True)
+                await log_channel.send(embed=embed)
 
     async def on_command_error(self, context: Context, error) -> None:
         """
@@ -178,7 +181,8 @@ class DiscordBot(commands.Bot):
             )
             await context.send(embed=embed)
         elif isinstance(error, commands.NotOwner):
-            log_channel = bot.get_channel(int(os.getenv("LOGGING_CHANNEL")))
+            logging_channel_id = os.getenv("LOGGING_CHANNEL")
+            log_channel = bot.get_channel(int(logging_channel_id)) if logging_channel_id else None
             embed = discord.Embed(
                 description="You are not the owner of the bot!", color=0xE02B2B
             )
@@ -187,16 +191,18 @@ class DiscordBot(commands.Bot):
                 self.logger.warning(
                     f"{context.author} (ID: {context.author.id}) tried to execute an owner only command in the guild {context.guild.name} (ID: {context.guild.id}), but the user is not an owner of the bot."
                 )
-                embed = discord.Embed(title=f"Command run by {context.author}", description="tried to execute an owner only command, but the user is not an owner of the bot.")
-                embed.add_field(name=f"in {context.guild.name}", value=context.message.content, inline=True)
-                await log_channel.send(embed=embed)
+                if log_channel:
+                    embed = discord.Embed(title=f"Command run by {context.author}", description="tried to execute an owner only command, but the user is not an owner of the bot.")
+                    embed.add_field(name=f"in {context.guild.name}", value=context.message.content, inline=True)
+                    await log_channel.send(embed=embed)
             else:
                 self.logger.warning(
                     f"{context.author} (ID: {context.author.id}) tried to execute an owner only command in the bot's DMs, but the user is not an owner of the bot."
                 )
-                embed = discord.Embed(title=f"Command run by {context.author}", description="tried to execute an owner only command, but the user is not an owner of the bot.")
-                embed.add_field(name=f"in DMs", value=context.message.content, inline=True)
-                await log_channel.send(embed=embed)
+                if log_channel:
+                    embed = discord.Embed(title=f"Command run by {context.author}", description="tried to execute an owner only command, but the user is not an owner of the bot.")
+                    embed.add_field(name=f"in DMs", value=context.message.content, inline=True)
+                    await log_channel.send(embed=embed)
         elif isinstance(error, commands.MissingPermissions):
             embed = discord.Embed(
                 description="You are missing the permission(s) `"
