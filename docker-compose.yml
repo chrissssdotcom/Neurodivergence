@@ -1,0 +1,16 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      libretranslate:
+        condition: service_started
+    env_file: .env
+    environment:
+      - LIBRETRANSLATE_URL=http://libretranslate:5000
+
+  libretranslate:
+    image: libretranslate/libretranslate
+    restart: unless-stopped
+    environment:
+      - LT_LOAD_ONLY=en,zh

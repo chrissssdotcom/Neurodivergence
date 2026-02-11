@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM python AS build
+FROM python
 RUN mkdir /data
 WORKDIR /data
 COPY . /data
