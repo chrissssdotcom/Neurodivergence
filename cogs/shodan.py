@@ -12,22 +12,16 @@ SHODAN_SEARCH_URL = "https://api.shodan.io/shodan/host/search"
 SHODAN_HOST_URL = "https://www.shodan.io/host"
 
 def _safe_join(items, limit: int = 3) -> str:
-    if not items:
+    if not items or not isinstance(items, (list, tuple)):
+        return str(items) if items else "N/A"
+    trimmed = [str(x) for x in items if x is not None and str(x).strip()]
+    if not trimmed:
         return "N/A"
-    if isinstance(items, (list, tuple)):
-        trimmed = [str(x) for x in items if x is not None and str(x).strip()]
-        if not trimmed:
-            return "N/A"
-        if len(trimmed) > limit:
-            return ", ".join(trimmed[:limit]) + f" (+{len(trimmed) - limit} more)"
-        return ", ".join(trimmed)
-    return str(items)
+    if len(trimmed) > limit:
+        return ", ".join(trimmed[:limit]) + f" (+{len(trimmed) - limit} more)"
+    return ", ".join(trimmed)
 
 def _extract_screenshot(match: Dict[str, Any]) -> Optional[Tuple[bytes, str]]:
-    """
-    Shodan can include screenshots as base64 in `match["screenshot"]["data"]`.
-    Returns (bytes, ext) or None.
-    """
     screenshot = match.get("screenshot")
     if not isinstance(screenshot, dict):
         return None
@@ -41,142 +35,236 @@ def _extract_screenshot(match: Dict[str, Any]) -> Optional[Tuple[bytes, str]]:
     except Exception:
         return None
 
-class RetryShodanButton(discord.ui.View):
-    def __init__(
-        self,
-        user: discord.User,
-        city: str,
-        screenshot_matches: List[Dict[str, Any]],
-        already_used_indices: Optional[List[int]] = None,
-        timeout: float = 60.0,
-    ):
-        super().__init__(timeout=timeout)
-        self.requester_id = getattr(user, 'id', None)
-        self.city = city
-        self.screenshot_matches = screenshot_matches
-        self.already_used_indices = already_used_indices or []
-        self.current_ip = None  # Will hold the IP of the *most recent* shown result
+def _get_data_str(match: Dict[str, Any]) -> Optional[str]:
+    """Returns the raw data as a string if available, else None."""
+    data = match.get("data")
+    if not data:
+        return None
+    if isinstance(data, bytes):
+        try:
+            data = data.decode(errors="replace")
+        except Exception:
+            data = str(data)
+    if not isinstance(data, str):
+        data = str(data)
+    return data
 
-    def _add_shodan_button(self, initial_ip=None):
-        # Remove all existing link buttons, then add the new one for the current IP
-        for child in list(self.children):
-            if isinstance(child, discord.ui.Button) and child.style == discord.ButtonStyle.link:
-                self.remove_item(child)
-
-        ip = initial_ip or self.current_ip
-        if ip and ip != "N/A":
-            shodan_url = f"{SHODAN_HOST_URL}/{ip}"
-            self.add_item(discord.ui.Button(label="Open in Shodan", url=shodan_url, style=discord.ButtonStyle.link))
-
-    async def disable_all(self):
-        for child in self.children:
-            if isinstance(child, discord.ui.Button) and not (child.style == discord.ButtonStyle.link):
-                child.disabled = True
-
-    async def generate_embed_and_file(self, random_index=None):
-        matches = self.screenshot_matches
-        total = len(matches)
-        available_indices = list(set(range(total)) - set(self.already_used_indices))
-        if not available_indices:
-            embed = discord.Embed(
-                title="Shodan",
-                description="No more unique results left for retry.",
-            )
-            return embed, None, None
-        if random_index is None:
-            idx = random.choice(available_indices)
-        else:
-            idx = random_index
-        match = matches[idx]
-        extracted = _extract_screenshot(match)
-        if not extracted:
-            embed = discord.Embed(
-                title="Shodan",
-                description="Failed to decode screenshot.",
-            )
-            return embed, None, None
-        image_bytes, ext = extracted
-        filename = f"shodan_{self.city.lower().replace(' ', '_')}.{ext}"
-        file = discord.File(io.BytesIO(image_bytes), filename=filename)
-
+def _get_concatenated_raw_data_file(matches: List[Dict[str, Any]], base_filename: str, start_idx: int) -> Optional[discord.File]:
+    """
+    Returns a discord.File with the concatenated 'data' fields from the given matches.
+    """
+    contents = []
+    for idx, match in enumerate(matches, start=start_idx + 1):
         ip = match.get("ip_str") or "N/A"
         port = match.get("port") or "N/A"
-        org = match.get("org") or match.get("isp") or "N/A"
-        asn = match.get("asn") or "N/A"
-        hostnames = _safe_join(match.get("hostnames"))
-        domains = _safe_join(match.get("domains"))
-        product = match.get("product") or "N/A"
-        transport = match.get("transport") or "N/A"
-        timestamp = match.get("timestamp") or "N/A"
+        banner = _get_data_str(match)
+        header = f"========== [{idx}] {ip}:{port} ==========\n"
+        if banner:
+            contents.append(header + banner + "\n")
+    if not contents:
+        return None
+    joined = "\n".join(contents)
+    data_bytes = joined.encode("utf-8", errors="replace")
+    # Discord (2024) allows up to 25MB per file, up to 10 attachments.
+    # Let's cap raw data size to a few MB to be safe.
+    MAX_SIZE = 8 * 1024 * 1024
+    truncated = False
+    if len(data_bytes) > MAX_SIZE:
+        data_bytes = data_bytes[:MAX_SIZE]
+        data_bytes += b"\n... (truncated)\n"
+        truncated = True
+    filename_root = base_filename.replace(" ", "_").lower()
+    filename = f"{filename_root}_raw_data.txt"
+    fileobj = io.BytesIO(data_bytes)
+    return discord.File(fileobj, filename=filename)
 
-        location = match.get("location") if isinstance(match.get("location"), dict) else {}
-        country = (location.get("country_name") or location.get("country_code") or "N/A") if location else "N/A"
-        region = (location.get("region_code") or location.get("region_name") or "N/A") if location else "N/A"
+class ShodanPageView(discord.ui.View):
+    def __init__(
+        self,
+        *,
+        requester: discord.User,
+        matches: List[Dict[str, Any]],
+        page_size: int = 10,
+        page: int = 0,
+        screenshots: bool = False,
+        query: str = "",
+        timeout: float = 120.0,
+    ):
+        super().__init__(timeout=timeout)
+        self.requester_id = getattr(requester, "id", None)
+        self.matches = matches
+        self.page_size = page_size
+        self.page = page
+        self.screenshots = screenshots
+        self.query = query
 
-        embed = discord.Embed(
-            title=f"Shodan screenshot — {self.city}",
-            description=f'Query: `city:"{self.city}" has_screenshot:true`',
-        )
-        embed.add_field(name="IP:Port", value=f"`{ip}:{port}`", inline=True)
-        embed.add_field(name="Org/ISP", value=str(org), inline=True)
-        if asn and asn != "N/A":
-            mxtoolbox_url = f"https://mxtoolbox.com/SuperTool.aspx?action=asn%3a{asn}&run=toolpage"
-            asn_value = f"[{asn}]({mxtoolbox_url})"
-        else:
-            asn_value = "N/A"
-        embed.add_field(name="ASN", value=asn_value, inline=True)
-        embed.add_field(name="Country/Region", value=f"{country} / {region}", inline=True)
-        embed.add_field(name="Product", value=str(product), inline=True)
-        embed.add_field(name="Transport", value=str(transport), inline=True)
-        embed.add_field(name="Hostnames", value=hostnames, inline=False)
-        embed.add_field(name="Domains", value=domains, inline=False)
-        embed.set_footer(text=f"Seen: {timestamp}")
-        embed.set_image(url=f"attachment://{filename}")
+        self.total_pages = max(1, (len(matches) + page_size - 1) // page_size)
 
-        # Fix: Always ensure only one Open in Shodan button (and it's up-to-date)
-        self.current_ip = ip if ip and ip != "N/A" else None
-        self._add_shodan_button(initial_ip=self.current_ip)
-
-        return embed, file, idx
-
-    @discord.ui.button(label="Retry", style=discord.ButtonStyle.primary, custom_id="shodan_retry")
-    async def retry(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Only the original requester can use this button
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if self.requester_id is not None and interaction.user.id != self.requester_id:
             await interaction.response.send_message(
                 "Only the original requester can use this button.", ephemeral=True
             )
-            return
+            return False
+        return True
 
-        # Make sure the already_used_indices includes the current result to avoid reshowing it due to speed-clicking
-        if hasattr(self, "current_ip") and self.current_ip is not None:
-            # Try to append the index of the current_ip in our matches to already_used_indices
-            for idx, match in enumerate(self.screenshot_matches):
-                if match.get("ip_str") == self.current_ip and idx not in self.already_used_indices:
-                    self.already_used_indices.append(idx)
-                    break
+    @discord.ui.button(label="◀ Previous Page", style=discord.ButtonStyle.primary, row=0, custom_id="shodan_prev")
+    async def previous_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page -= 1
+        await self._update_message(interaction)
+    
+    @discord.ui.button(label="Next Page ▶", style=discord.ButtonStyle.primary, row=0, custom_id="shodan_next")
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page += 1
+        await self._update_message(interaction)
 
-        embed, file, idx = await self.generate_embed_and_file()
-        # If nothing available, disable all buttons and update
-        if file is None:
-            await self.disable_all()
-            await interaction.response.edit_message(embed=embed, view=self, attachments=[])
-            return
+    async def _update_message(self, interaction: discord.Interaction):
+        for item in self.children:
+            item.disabled = False
+        if self.page <= 0:
+            self.previous_page.disabled = True
+        if self.page >= self.total_pages - 1:
+            self.next_page.disabled = True
 
-        # When using the Retry button, always append the new index of the result we show.
-        self.already_used_indices.append(idx)
-
-        # Refresh the "Open in Shodan" button to update for the new IP
-        self._add_shodan_button(initial_ip=self.current_ip)
-
-        await interaction.response.edit_message(embed=embed, view=self, attachments=[file])
+        embed, files = await self.format_embed_and_files()
+        await interaction.response.edit_message(
+            embed=embed,
+            attachments=files if files else [],
+            view=self
+        )
 
     async def on_timeout(self):
-        await self.disable_all()
-        try:
-            pass
-        except Exception:
-            pass
+        for item in self.children:
+            item.disabled = True
+
+    async def format_embed_and_files(self) -> Tuple[discord.Embed, Optional[List[discord.File]]]:
+        """
+        Returns a tuple of (discord.Embed, Optional[List[discord.File]]) for current page.
+        Files can be screenshot image and/or raw data .txt.
+        """
+        start = self.page * self.page_size
+        end = min(len(self.matches), start + self.page_size)
+        current_matches = self.matches[start:end]
+
+        if not self.screenshots:
+            desc_lines = []
+            files = []
+            # Prepare single concatenated raw data file for this page
+            # Use the city/first IP of page for filename root, otherwise fallback.
+            if current_matches:
+                sample_ip = current_matches[0].get("ip_str") or "page"
+            else:
+                sample_ip = "page"
+            raw_file = _get_concatenated_raw_data_file(current_matches, f"{sample_ip}_{start+1}-{end}", start)
+            for idx, m in enumerate(current_matches, start=start + 1):
+                ip = m.get("ip_str") or "N/A"
+                port = m.get("port") or "N/A"
+                org = m.get("org") or m.get("isp") or "N/A"
+                product = m.get("product") or "N/A"
+                asn = m.get("asn") or "N/A"
+                hostnames = _safe_join(m.get("hostnames"))
+                domains = _safe_join(m.get("domains"))
+                location = m.get("location") if isinstance(m.get("location"), dict) else {}
+                country = location.get("country_name") or location.get("country_code") or "N/A"
+                region = location.get("region_code") or location.get("region_name") or "N/A"
+                row = (
+                    f"**{idx}.** [`{ip}:{port}`]({SHODAN_HOST_URL}/{ip}) | {org}, {product}\n"
+                    f"ASN: {asn} | {country}/{region}\n"
+                    f"Hostnames: {hostnames}\nDomains: {domains}\n"
+                )
+                # Link to single data file if it exists and this row has data
+                if raw_file and _get_data_str(m):
+                    row += f"[Download raw data](attachment://{raw_file.filename})\n"
+                desc_lines.append(row)
+            embed = discord.Embed(
+                title=f"Shodan Results ({start+1}-{end} of {len(self.matches)})",
+                description="\n".join(desc_lines) if desc_lines else "No results.",
+                color=discord.Color.blue()
+            )
+            embed.set_footer(text=f"Page {self.page + 1}/{self.total_pages} | Query: {self.query}")
+
+            for item in self.children:
+                if isinstance(item, discord.ui.Button):
+                    if item.label.startswith("◀"):
+                        item.disabled = self.page <= 0
+                    elif item.label.startswith("Next"):
+                        item.disabled = self.page >= self.total_pages - 1
+
+            files = [raw_file] if raw_file else []
+            return embed, files if files else None
+        else:
+            match = current_matches[0] if current_matches else None
+            files = []
+            if not match:
+                embed = discord.Embed(title="Shodan", description="No screenshot results on this page.")
+                embed.set_footer(text=f"Page {self.page + 1}/{self.total_pages}")
+                for item in self.children:
+                    if isinstance(item, discord.ui.Button):
+                        if item.label.startswith("◀"):
+                            item.disabled = self.page <= 0
+                        elif item.label.startswith("Next"):
+                            item.disabled = self.page >= self.total_pages - 1
+                return embed, None
+            extracted = _extract_screenshot(match)
+            if not extracted:
+                embed = discord.Embed(title="Shodan", description="Failed to decode screenshot.")
+                embed.set_footer(text=f"Page {self.page + 1}/{self.total_pages}")
+                for item in self.children:
+                    if isinstance(item, discord.ui.Button):
+                        if item.label.startswith("◀"):
+                            item.disabled = self.page <= 0
+                        elif item.label.startswith("Next"):
+                            item.disabled = self.page >= self.total_pages - 1
+                return embed, None
+            image_bytes, ext = extracted
+            hint = match.get('city') or match.get('org') or 'custom'
+            filename = f"shodan_{str(hint).lower().replace(' ', '_')}_{start+1}.{ext}"
+            image_file = discord.File(io.BytesIO(image_bytes), filename=filename)
+            files.append(image_file)
+
+            ip = match.get("ip_str") or "N/A"
+            port = match.get("port") or "N/A"
+            org = match.get("org") or match.get("isp") or "N/A"
+            asn = match.get("asn") or "N/A"
+            hostnames = _safe_join(match.get("hostnames"))
+            domains = _safe_join(match.get("domains"))
+            product = match.get("product") or "N/A"
+            transport = match.get("transport") or "N/A"
+            timestamp = match.get("timestamp") or "N/A"
+
+            location = match.get("location") if isinstance(match.get("location"), dict) else {}
+            country = (location.get("country_name") or location.get("country_code") or "N/A") if location else "N/A"
+            region = (location.get("region_code") or location.get("region_name") or "N/A") if location else "N/A"
+
+            # For screenshot mode, keep current behavior: attach corresponding raw data file for the row
+            single_raw_file = None
+            if _get_data_str(match):
+                single_raw_file = _get_concatenated_raw_data_file([match], f"{ip}_{port}", start)
+                if single_raw_file:
+                    files.append(single_raw_file)
+            datalink = f"[Download raw data](attachment://{single_raw_file.filename})\n" if single_raw_file else ""
+
+            embed = discord.Embed(
+                title=f'Shodan Screenshot {start+1} of {len(self.matches)}',
+                description=(
+                    f"Query: `{self.query}`\n[`{ip}:{port}`]({SHODAN_HOST_URL}/{ip}) | {org}\n"
+                    f"Product: {product} | Transport: {transport}\n"
+                    f"ASN: {asn} | {country}/{region}\n"
+                    f"Hostnames: {hostnames}\nDomains: {domains}\n"
+                    f"{datalink}"
+                ),
+            )
+            embed.set_footer(text=f"Seen: {timestamp} | Page {self.page + 1}/{self.total_pages}")
+            embed.set_image(url=f"attachment://{filename}")
+
+            for item in self.children:
+                if isinstance(item, discord.ui.Button):
+                    if item.label.startswith("◀"):
+                        item.disabled = self.page <= 0
+                    elif item.label.startswith("Next"):
+                        item.disabled = self.page >= self.total_pages - 1
+
+            return embed, files if files else None
 
 class Shodan(commands.Cog, name="shodan"):
     def __init__(self, bot) -> None:
@@ -251,76 +339,92 @@ class Shodan(commands.Cog, name="shodan"):
             await msg.edit(embed=embed)
             return
 
-        idx = random.randrange(len(screenshot_matches))
-        match = screenshot_matches[idx]
-        extracted = _extract_screenshot(match)
-        if not extracted:
+        view = ShodanPageView(
+            requester=getattr(ctx, "author", getattr(ctx, "user", None)),
+            matches=screenshot_matches,
+            page_size=1,
+            page=0,
+            screenshots=True,
+            query=query,
+        )
+        embed, files = await view.format_embed_and_files()
+        await msg.edit(embed=embed, attachments=files if files else [], view=view)
+
+    @commands.hybrid_command(
+        name="mcserver",
+        description='Search Shodan for public Minecraft servers in a given city (query: city:"<city>" port:25565)',
+    )
+    async def mcserver(self, ctx, city: str = ""):
+        key = os.getenv("SHODAN_KEY")
+        if not key:
             embed = discord.Embed(
                 title="Shodan",
-                description="Failed to decode screenshot.",
+                description="`SHODAN_KEY` is not set on this bot.",
             )
+            await ctx.reply(embed=embed)
+            return
+
+        city = (city or "").strip()
+        if not city:
+            embed = discord.Embed(
+                title="Minecraft Server Finder",
+                description="Please provide a city name. Example: `/mcserver Paris`",
+            )
+            await ctx.reply(embed=embed)
+            return
+
+        query = f'city:"{city}" port:25565'
+        embed = discord.Embed(title="Minecraft Server Finder", description=f"Searching: `{query}`\nPlease wait...")
+        msg = await ctx.reply(embed=embed)
+
+        params = {
+            "key": key,
+            "query": query,
+            "limit": 100,
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(SHODAN_SEARCH_URL, params=params) as resp:
+                    if resp.status != 200:
+                        try:
+                            err = await resp.json()
+                            err_msg = err.get("error") or err.get("message") or str(err)
+                        except Exception:
+                            err_msg = await resp.text()
+                        embed = discord.Embed(
+                            title="Minecraft Server Finder",
+                            description=f"Error from Shodan: `{resp.status}`\n{err_msg}",
+                        )
+                        await msg.edit(embed=embed)
+                        return
+                    payload = await resp.json()
+        except Exception as e:
+            embed = discord.Embed(title="Minecraft Server Finder", description=f"Request failed: `{type(e).__name__}`")
             await msg.edit(embed=embed)
             return
 
-        image_bytes, ext = extracted
-        filename = f"shodan_{city.lower().replace(' ', '_')}.{ext}"
-        file = discord.File(io.BytesIO(image_bytes), filename=filename)
+        matches = payload.get("matches") if isinstance(payload, dict) else None
+        if not isinstance(matches, list) or not matches:
+            embed = discord.Embed(title="Minecraft Server Finder", description="No Minecraft servers found.")
+            await msg.edit(embed=embed)
+            return
 
-        ip = match.get("ip_str") or "N/A"
-        port = match.get("port") or "N/A"
-        org = match.get("org") or match.get("isp") or "N/A"
-        asn = match.get("asn") or "N/A"
-        hostnames = _safe_join(match.get("hostnames"))
-        domains = _safe_join(match.get("domains"))
-        product = match.get("product") or "N/A"
-        transport = match.get("transport") or "N/A"
-        timestamp = match.get("timestamp") or "N/A"
-
-        location = match.get("location") if isinstance(match.get("location"), dict) else {}
-        country = (location.get("country_name") or location.get("country_code") or "N/A") if location else "N/A"
-        region = (location.get("region_code") or location.get("region_name") or "N/A") if location else "N/A"
-
-        embed = discord.Embed(
-            title=f"Shodan screenshot — {city}",
-            description=f'Query: `city:"{city}" has_screenshot:true`',
+        page_size = 10
+        view = ShodanPageView(
+            requester=getattr(ctx, "author", getattr(ctx, "user", None)),
+            matches=matches,
+            page_size=page_size,
+            page=0,
+            screenshots=False,
+            query=query,
         )
-        embed.add_field(name="IP:Port", value=f"`{ip}:{port}`", inline=True)
-        embed.add_field(name="Org/ISP", value=str(org), inline=True)
-        asn_link = f"https://mxtoolbox.com/SuperTool.aspx?action=asn%3a{asn}&run=toolpage" if asn != "N/A" else None
-        if asn_link:
-            embed.add_field(name="ASN", value=f"[{asn}]({asn_link})", inline=True)
-        else:
-            embed.add_field(name="ASN", value=str(asn), inline=True)
-        embed.add_field(name="Country/Region", value=f"{country} / {region}", inline=True)
-        embed.add_field(name="Product", value=str(product), inline=True)
-        embed.add_field(name="Transport", value=str(transport), inline=True)
-        embed.add_field(name="Hostnames", value=hostnames, inline=False)
-        embed.add_field(name="Domains", value=domains, inline=False)
-        embed.set_footer(text=f"Seen: {timestamp}")
-        embed.set_image(url=f"attachment://{filename}")
+        embed, files = await view.format_embed_and_files()
+        await msg.edit(embed=embed, attachments=files if files else [], view=view)
 
-        shodan_url = None
-        if ip and ip != "N/A":
-            shodan_url = f"{SHODAN_HOST_URL}/{ip}"
-
-        view = RetryShodanButton(
-            user=getattr(ctx, "author", getattr(ctx, "user", None)),
-            city=city,
-            screenshot_matches=screenshot_matches,
-            already_used_indices=[idx],
-        )
-        # Add the link button for the initial IP (done internally now by RetryShodanButton's logic)
-        view._add_shodan_button(initial_ip=ip)
-
-        try:
-            await msg.delete()
-        except Exception:
-            pass
-        await ctx.reply(embed=embed, file=file, view=view)
-    
     @commands.hybrid_command(
         name="shodan_query",
-        description="Search Shodan with a custom query, requires has_screenshot:true in the query."
+        description="Search Shodan with a custom query.",
     )
     async def shodan_query(self, ctx, *, query: str = ""):
         key = os.getenv("SHODAN_KEY")
@@ -332,23 +436,22 @@ class Shodan(commands.Cog, name="shodan"):
             await ctx.reply(embed=embed)
             return
 
-        query = (query or "").strip()
-        if not query:
-            embed = discord.Embed(
-                title="Shodan",
-                description="Please provide a query string. Example: `/shodan_query org:\"Amazon\" has_screenshot:true`",
-            )
-            await ctx.reply(embed=embed)
-            return
+        query_orig = (query or "").strip()
+        screenshots = False
+        lower_query = query_orig.lower()
+        if "show:screenshot" in lower_query:
+            screenshots = True
+            base_query = query_orig.replace("show:screenshot", "").replace("SHOW:SCREENSHOT", "")
+        elif "show:list" in lower_query:
+            screenshots = False
+            base_query = query_orig.replace("show:list", "").replace("SHOW:LIST", "")
+        else:
+            screenshots = "has_screenshot:true" in lower_query
+            base_query = query_orig
 
-        # Optionally ensure has_screenshot:true is in the query
-        if "has_screenshot:true" not in query:
-            embed = discord.Embed(
-                title="Shodan",
-                description="Your query must include `has_screenshot:true` to return screenshot results.",
-            )
-            await ctx.reply(embed=embed)
-            return
+        query = base_query.strip()
+        if screenshots and "has_screenshot:true" not in query.lower():
+            query = (query + " has_screenshot:true").strip()
 
         embed = discord.Embed(title="Shodan", description=f"Searching: `{query}`\nPlease wait...")
         msg = await ctx.reply(embed=embed)
@@ -386,84 +489,38 @@ class Shodan(commands.Cog, name="shodan"):
             await msg.edit(embed=embed)
             return
 
-        screenshot_matches = [m for m in matches if _extract_screenshot(m)]
-        if not screenshot_matches:
-            embed = discord.Embed(
-                title="Shodan",
-                description="Results found, but none included screenshot data.",
+        if screenshots:
+            screenshot_matches = [m for m in matches if _extract_screenshot(m)]
+            if not screenshot_matches:
+                embed = discord.Embed(
+                    title="Shodan",
+                    description="Results found, but none included screenshot data.",
+                )
+                await msg.edit(embed=embed)
+                return
+
+            view = ShodanPageView(
+                requester=getattr(ctx, "author", getattr(ctx, "user", None)),
+                matches=screenshot_matches,
+                page_size=1,
+                page=0,
+                screenshots=True,
+                query=query_orig,
             )
-            await msg.edit(embed=embed)
-            return
-
-        idx = random.randrange(len(screenshot_matches))
-        match = screenshot_matches[idx]
-        extracted = _extract_screenshot(match)
-        if not extracted:
-            embed = discord.Embed(
-                title="Shodan",
-                description="Failed to decode screenshot.",
-            )
-            await msg.edit(embed=embed)
-            return
-
-        image_bytes, ext = extracted
-        # Try to guess a city or org for filename, fallback to generic
-        hint = match.get('city') or match.get('org') or "custom"
-        filename = f"shodan_{str(hint).lower().replace(' ', '_')}.{ext}"
-        file = discord.File(io.BytesIO(image_bytes), filename=filename)
-
-        ip = match.get("ip_str") or "N/A"
-        port = match.get("port") or "N/A"
-        org = match.get("org") or match.get("isp") or "N/A"
-        asn = match.get("asn") or "N/A"
-        hostnames = _safe_join(match.get("hostnames"))
-        domains = _safe_join(match.get("domains"))
-        product = match.get("product") or "N/A"
-        transport = match.get("transport") or "N/A"
-        timestamp = match.get("timestamp") or "N/A"
-
-        location = match.get("location") if isinstance(match.get("location"), dict) else {}
-        country = (location.get("country_name") or location.get("country_code") or "N/A") if location else "N/A"
-        region = (location.get("region_code") or location.get("region_name") or "N/A") if location else "N/A"
-
-        embed = discord.Embed(
-            title=f'Shodan screenshot — Custom Query',
-            description=f"Query: `{query}`",
-        )
-        embed.add_field(name="IP:Port", value=f"`{ip}:{port}`", inline=True)
-        embed.add_field(name="Org/ISP", value=str(org), inline=True)
-        asn_link = f"https://mxtoolbox.com/SuperTool.aspx?action=asn%3a{asn}&run=toolpage" if asn != "N/A" else None
-        if asn_link:
-            embed.add_field(name="ASN", value=f"[{asn}]({asn_link})", inline=True)
+            embed, files = await view.format_embed_and_files()
+            await msg.edit(embed=embed, attachments=files if files else [], view=view)
         else:
-            embed.add_field(name="ASN", value=str(asn), inline=True)
-        embed.add_field(name="Country/Region", value=f"{country} / {region}", inline=True)
-        embed.add_field(name="Product", value=str(product), inline=True)
-        embed.add_field(name="Transport", value=str(transport), inline=True)
-        embed.add_field(name="Hostnames", value=hostnames, inline=False)
-        embed.add_field(name="Domains", value=domains, inline=False)
-        embed.set_footer(text=f"Seen: {timestamp}")
-        embed.set_image(url=f"attachment://{filename}")
-
-        shodan_url = None
-        if ip and ip != "N/A":
-            shodan_url = f"{SHODAN_HOST_URL}/{ip}"
-
-        # Use the RetryShodanButton as above, but set city=hint just for filename context
-        view = RetryShodanButton(
-            user=getattr(ctx, "author", getattr(ctx, "user", None)),
-            city=hint if hint else "Custom",
-            screenshot_matches=screenshot_matches,
-            already_used_indices=[idx],
-        )
-        # Add the link button for the initial IP (done internally now by RetryShodanButton's logic)
-        view._add_shodan_button(initial_ip=ip)
-
-        try:
-            await msg.delete()
-        except Exception:
-            pass
-        await ctx.reply(embed=embed, file=file, view=view)
+            page_size = 10
+            view = ShodanPageView(
+                requester=getattr(ctx, "author", getattr(ctx, "user", None)),
+                matches=matches,
+                page_size=page_size,
+                page=0,
+                screenshots=False,
+                query=query_orig,
+            )
+            embed, files = await view.format_embed_and_files()
+            await msg.edit(embed=embed, attachments=files if files else [], view=view)
 
 async def setup(bot) -> None:
     await bot.add_cog(Shodan(bot))
